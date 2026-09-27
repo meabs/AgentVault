@@ -197,6 +197,8 @@ class ApprovalChallenge(BaseModel):
     code_digest: str
     expires_at: datetime
     used_at: datetime | None = None
+    failed_attempts: int = 0
+    locked_at: datetime | None = None
 
 
 class AuditEvent(BaseModel):

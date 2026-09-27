@@ -5,7 +5,7 @@ from datetime import date, timedelta
 from pav.adapters.mcp.server import create_server
 from pav.adapters.notifications import LogNotifier
 from pav.adapters.rest.app import create_app
-from pav.authority.capabilities import MockSecretProvider
+from pav.authority.capabilities import MockSecretProvider, SecretProvider
 from pav.authority.service import Authority
 from pav.domain.models import Attribute, ClaimDefinition, ExternalHandle, Policy
 from pav.domain.types import AccessMode, DecisionOutcome, Sensitivity
@@ -14,7 +14,11 @@ from pav.domain.types import AccessMode, DecisionOutcome, Sensitivity
 DEMO_SECRET = "demo-booking-secret-NEVER-IN-MCP"
 
 
-def create_demo_stack() -> tuple[Authority, object, object]:
+def create_demo_stack(
+    *,
+    external_handle: ExternalHandle | None = None,
+    secret_provider: SecretProvider | None = None,
+) -> tuple[Authority, object, object]:
     """Build a local demo vault; all workflow operations go through adapters."""
 
     def age_over_18(values: dict[str, object]) -> bool:
@@ -27,6 +31,13 @@ def create_demo_stack() -> tuple[Authority, object, object]:
             birthday.day,
         )
 
+    handle = external_handle or ExternalHandle(
+        name="credentials.booking_site", uri="secret://mock/booking-site"
+    )
+    provider = secret_provider or MockSecretProvider(
+        {"credentials.booking_site": DEMO_SECRET},
+        {"credentials.booking_site": {"booking.example"}},
+    )
     authority = Authority(
         attributes={
             "identity.full_name": Attribute(
@@ -53,9 +64,7 @@ def create_demo_stack() -> tuple[Authority, object, object]:
             )
         },
         external_handles={
-            "credentials.booking_site": ExternalHandle(
-                name="credentials.booking_site", uri="secret://mock/booking-site"
-            )
+            handle.name: handle
         },
         policies=[
             Policy(
@@ -74,10 +83,7 @@ def create_demo_stack() -> tuple[Authority, object, object]:
                 max_uses=1,
             ),
         ],
-        secret_provider=MockSecretProvider(
-            {"credentials.booking_site": DEMO_SECRET},
-            {"credentials.booking_site": {"booking.example"}},
-        ),
+        secret_provider=provider,
     )
     notifier = LogNotifier()
     return authority, create_server(authority, notifier=notifier), create_app(authority, notifier=notifier)

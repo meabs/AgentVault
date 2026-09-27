@@ -46,6 +46,9 @@ from pav.domain.types import (
 from pav.persistence import AuthorityStorage, InMemoryStorage
 
 
+APPROVAL_CODE_MAX_FAILED_ATTEMPTS = 5
+
+
 class Authority:
     """PAV's policy enforcement point and authority lifecycle."""
 
@@ -245,16 +248,35 @@ class Authority:
                 raise ValueError("only approval-required requests can receive an approval code")
             if request_id in self.approval_challenges:
                 return None
-            alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-            code = "".join(secrets.choice(alphabet) for _ in range(10))
-            challenge = ApprovalChallenge(
-                request_id=request_id,
-                code_digest=self._approval_code_digest(code),
-                expires_at=self._now() + self.approval_code_ttl,
-            )
-            self.approval_challenges[request_id] = challenge
-            self.storage.save_approval_challenge(challenge)
-            return code, challenge
+            return self._issue_approval_challenge(request_id)
+
+    def _issue_approval_challenge(self, request_id: str) -> tuple[str, ApprovalChallenge]:
+        alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        code = "".join(secrets.choice(alphabet) for _ in range(10))
+        challenge = ApprovalChallenge(
+            request_id=request_id,
+            code_digest=self._approval_code_digest(code),
+            expires_at=self._now() + self.approval_code_ttl,
+        )
+        self.approval_challenges[request_id] = challenge
+        self.storage.save_approval_challenge(challenge)
+        return code, challenge
+
+    def resend_approval_challenge(
+        self, request: AccessRequest | str
+    ) -> tuple[str, ApprovalChallenge]:
+        """Issue a fresh code for a still-pending approval request."""
+        with self._approval_lock:
+            request_id = request.id if isinstance(request, AccessRequest) else request
+            decision = self.decisions.get(request_id)
+            if (
+                decision is None
+                or decision.outcome is not DecisionOutcome.APPROVAL_REQUIRED
+                or decision.approved
+                or any(grant.request_id == request_id for grant in self.grants.values())
+            ):
+                raise ValueError("only still-pending requests can receive a fresh approval code")
+            return self._issue_approval_challenge(request_id)
 
     def approval_code_failure(self, request_id: str, code: str | None) -> str | None:
         challenge = self.approval_challenges.get(request_id)
@@ -262,6 +284,8 @@ class Authority:
             return "missing"
         if challenge is None:
             return "unavailable"
+        if challenge.locked_at is not None:
+            return "locked_out"
         if challenge.used_at is not None:
             return "already_used"
         if self._now() >= challenge.expires_at:
@@ -274,6 +298,25 @@ class Authority:
         with self._approval_lock:
             failure = self.approval_code_failure(request_id, code)
             if failure is not None:
+                if failure == "incorrect":
+                    challenge = self.approval_challenges[request_id]
+                    failed_attempts = challenge.failed_attempts + 1
+                    locked_at = (
+                        self._now()
+                        if failed_attempts >= APPROVAL_CODE_MAX_FAILED_ATTEMPTS
+                        else None
+                    )
+                    updated = challenge.model_copy(
+                        update={
+                            "failed_attempts": failed_attempts,
+                            "locked_at": locked_at,
+                            "code_digest": "" if locked_at is not None else challenge.code_digest,
+                        }
+                    )
+                    self.approval_challenges[request_id] = updated
+                    self.storage.save_approval_challenge(updated)
+                    if locked_at is not None:
+                        return "locked_out"
                 return failure
             challenge = self.approval_challenges[request_id]
             consumed = challenge.model_copy(update={"used_at": self._now()})
@@ -285,13 +328,17 @@ class Authority:
         request = self.requests.get(request_id)
         if request is None:
             return
+        metadata: dict[str, str | int] = {"reason": reason}
+        challenge = self.approval_challenges.get(request_id)
+        if challenge is not None:
+            metadata["failed_attempts"] = challenge.failed_attempts
         self._event(
             AuditEventType.APPROVAL_CODE_REJECTED,
             task_id=request.task_id,
             agent_id=request.agent_id,
             request_id=request.id,
             purpose=request.purpose,
-            metadata={"reason": reason},
+            metadata=metadata,
         )
 
     def approve(self, decision: PolicyDecision) -> PolicyDecision:

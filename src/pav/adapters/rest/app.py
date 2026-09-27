@@ -269,6 +269,13 @@ def create_app(
             notifier.notify(request_id=request_id, code=code, approval_url=approval_url(request_id))
         return approval_url(request_id)
 
+    def resend_approval(request_id: str) -> None:
+        try:
+            code, _ = authority.resend_approval_challenge(request_id)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        notifier.notify(request_id=request_id, code=code, approval_url=approval_url(request_id))
+
     @api.exception_handler(AuthorityError)
     async def authority_error_handler(_: Request, error: AuthorityError) -> JSONResponse:
         status = 403
@@ -417,8 +424,12 @@ def create_app(
             sections.append(f'<section class="mode-section"><header><h2>{_text(mode.value.upper())}</h2><span>{section_copy[mode][0]}</span></header>{body}</section>')
 
         if decision.outcome is DecisionOutcome.APPROVAL_REQUIRED and not decision.approved and status.grant is None:
-            banner = '<div class="notice">This request is waiting for your decision. A human-presence code was sent to your desktop notification. It is not shown on this page. Enter it to approve; denying never requires the code.</div>'
-            actions = f'<div class="actions"><form method="post" action="/approvals/{_text(request.id)}/approve"><label for="approval-code">Human-presence code</label><input id="approval-code" name="code" type="text" inputmode="text" autocomplete="off" required><button type="submit">Approve request</button></form><form method="post" action="/approvals/{_text(request.id)}/deny"><button class="secondary" type="submit">Deny request</button></form></div>'
+            challenge = authority.approval_challenges.get(request.id)
+            if challenge is not None and challenge.locked_at is not None:
+                banner = '<div class="notice danger">The previous approval code is locked out after too many incorrect attempts. Request a fresh code to continue; denying never requires a code.</div>'
+            else:
+                banner = '<div class="notice">This request is waiting for your decision. A human-presence code was sent to your desktop notification. It is not shown on this page. Enter it to approve; denying never requires the code.</div>'
+            actions = f'<div class="actions"><form method="post" action="/approvals/{_text(request.id)}/approve"><label for="approval-code">Human-presence code</label><input id="approval-code" name="code" type="text" inputmode="text" autocomplete="off" required><button type="submit">Approve request</button></form><form method="post" action="/approvals/{_text(request.id)}/resend"><button class="secondary" type="submit">Send a fresh code</button></form><form method="post" action="/approvals/{_text(request.id)}/deny"><button class="secondary" type="submit">Deny request</button></form></div>'
         elif status.grant is not None:
             banner = f'<div class="notice success"><strong>Approved.</strong> Grant <a href="/ui/grants/{_text(status.grant.id)}">{_text(status.grant.id)}</a> is active until {_text(_when(status.grant.expires_at))}.</div>'
             actions = '<div class="actions"><a class="button secondary" href="/">Return home</a></div>'
@@ -451,10 +462,16 @@ def create_app(
                 "incorrect": "approval code is incorrect",
                 "expired": "approval code has expired",
                 "already_used": "approval code was already used",
+                "locked_out": "approval code is locked out; request a fresh code",
                 "unavailable": "approval code is unavailable",
             }
             raise HTTPException(status_code=403, detail=messages[failure])
         approve_pending(request_id)
+        return RedirectResponse(url=f"/approvals/{request_id}", status_code=303)
+
+    @api.post("/approvals/{request_id}/resend")
+    def ui_resend_approval(request_id: str) -> RedirectResponse:
+        resend_approval(request_id)
         return RedirectResponse(url=f"/approvals/{request_id}", status_code=303)
 
     @api.post("/approvals/{request_id}/deny")

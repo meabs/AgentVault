@@ -5,7 +5,7 @@ from datetime import timedelta
 from fastapi.testclient import TestClient
 
 from pav.adapters.rest.app import create_app
-from pav.authority.service import Authority
+from pav.authority.service import APPROVAL_CODE_MAX_FAILED_ATTEMPTS, Authority
 from pav.domain.types import AuditEventType, DecisionOutcome, GrantState
 
 
@@ -136,6 +136,68 @@ def test_wrong_approval_code_fails_and_is_audited(authority: Authority) -> None:
     assert not [grant for grant in authority.grants.values() if grant.request_id == request_id]
     rejected = [event for event in authority.audit(task=task_id) if event.event_type is AuditEventType.APPROVAL_CODE_REJECTED]
     assert rejected[-1].metadata["reason"] == "incorrect"
+
+
+def test_repeated_wrong_codes_lock_out_the_current_code(authority: Authority) -> None:
+    client = _client(authority)
+    task_id, request_id = _pending_booking(client)
+    correct_code = _approval_code(client, request_id)
+
+    for attempt in range(APPROVAL_CODE_MAX_FAILED_ATTEMPTS):
+        response = client.post(
+            f"/approvals/{request_id}/approve",
+            data={"code": f"WRONG-CODE-{attempt}"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 403
+
+    still_locked = client.post(
+        f"/approvals/{request_id}/approve",
+        data={"code": correct_code},
+        follow_redirects=False,
+    )
+
+    assert still_locked.status_code == 403
+    assert "locked out" in still_locked.json()["detail"]
+    status = client.get(f"/access-requests/{request_id}").json()
+    assert status["decision"]["outcome"] == "APPROVAL_REQUIRED"
+    assert status["grant"] is None
+    events = [
+        event
+        for event in authority.audit(task=task_id)
+        if event.event_type is AuditEventType.APPROVAL_CODE_REJECTED
+    ]
+    assert events[-1].metadata["reason"] == "locked_out"
+    assert any(event.metadata["reason"] == "incorrect" for event in events)
+
+
+def test_resending_after_lockout_issues_a_fresh_working_code(authority: Authority) -> None:
+    client = _client(authority)
+    task_id, request_id = _pending_booking(client)
+    original_code = _approval_code(client, request_id)
+
+    for attempt in range(APPROVAL_CODE_MAX_FAILED_ATTEMPTS):
+        client.post(
+            f"/approvals/{request_id}/approve",
+            data={"code": f"WRONG-CODE-{attempt}"},
+            follow_redirects=False,
+        )
+
+    resent = client.post(f"/approvals/{request_id}/resend", follow_redirects=False)
+    fresh_code = client.app.state.notifier.notifications[-1].code
+
+    assert resent.status_code == 303
+    assert fresh_code != original_code
+    approved = client.post(
+        f"/approvals/{request_id}/approve",
+        data={"code": fresh_code},
+        follow_redirects=False,
+    )
+
+    assert approved.status_code == 303
+    assert len([grant for grant in authority.grants.values() if grant.request_id == request_id]) == 1
+    assert authority.approval_challenges[request_id].failed_attempts == 0
+    assert authority.audit(task=task_id)
 
 
 def test_expired_approval_code_fails_even_when_originally_correct(authority: Authority, clock) -> None:
