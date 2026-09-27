@@ -277,6 +277,24 @@ class Authority:
         )
         return approved
 
+    def deny(self, decision: PolicyDecision) -> PolicyDecision:
+        """Record a user's denial without issuing a grant."""
+        if decision.outcome is not DecisionOutcome.APPROVAL_REQUIRED:
+            raise ValueError("only approval-required decisions can be denied")
+        denied = decision.model_copy(update={"outcome": DecisionOutcome.DENY, "approved": False})
+        self.decisions[decision.request.id] = denied
+        self.storage.save_decision(denied)
+        request = decision.request
+        self._event(
+            AuditEventType.APPROVAL_DENIED,
+            task_id=request.task_id,
+            agent_id=request.agent_id,
+            request_id=request.id,
+            purpose=request.purpose,
+            metadata={"item_count": len(request.items)},
+        )
+        return denied
+
     def authorize(self, decision: PolicyDecision) -> Grant:
         if decision.outcome is DecisionOutcome.DENY:
             raise AccessDenied("policy denied the access request")
