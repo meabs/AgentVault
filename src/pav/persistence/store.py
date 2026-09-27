@@ -214,6 +214,8 @@ class SQLiteStorage:
                 CREATE TABLE IF NOT EXISTS external_handles (
                     name TEXT PRIMARY KEY,
                     uri TEXT NOT NULL,
+                    provider TEXT NOT NULL DEFAULT 'mock',
+                    allowed_destinations TEXT NOT NULL DEFAULT '[]',
                     sensitivity TEXT NOT NULL,
                     resource_type TEXT NOT NULL
                 );
@@ -229,6 +231,18 @@ class SQLiteStorage:
                 );
                 """
             )
+            columns = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(external_handles)")
+            }
+            if "provider" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE external_handles ADD COLUMN provider TEXT NOT NULL DEFAULT 'mock'"
+                )
+            if "allowed_destinations" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE external_handles ADD COLUMN allowed_destinations TEXT NOT NULL DEFAULT '[]'"
+                )
 
     def _execute(self, sql: str, parameters: tuple = ()) -> list[sqlite3.Row]:
         with self._lock, self._connection:
@@ -292,6 +306,8 @@ class SQLiteStorage:
             row["name"]: ExternalHandle(
                 name=row["name"],
                 uri=row["uri"],
+                provider=row["provider"],
+                allowed_destinations=set(json.loads(row["allowed_destinations"])),
                 sensitivity=row["sensitivity"],
                 resource_type=row["resource_type"],
             )
@@ -300,8 +316,17 @@ class SQLiteStorage:
 
     def save_external_handle(self, handle: ExternalHandle) -> None:
         self._execute(
-            "INSERT OR REPLACE INTO external_handles (name, uri, sensitivity, resource_type) VALUES (?, ?, ?, ?)",
-            (handle.name, handle.uri, handle.sensitivity.value, handle.resource_type),
+            """INSERT OR REPLACE INTO external_handles
+            (name, uri, provider, allowed_destinations, sensitivity, resource_type)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                handle.name,
+                handle.uri,
+                handle.provider,
+                json.dumps(sorted(handle.allowed_destinations)),
+                handle.sensitivity.value,
+                handle.resource_type,
+            ),
         )
 
     def _load_models(self, table: str, model_type: type) -> dict[str, object]:

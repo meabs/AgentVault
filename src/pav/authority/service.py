@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatchcase
 from typing import Any
 
-from pav.authority.capabilities import MockSecretProvider, SecretProvider
+from pav.authority.capabilities import (
+    MacOSKeychainSecretProvider,
+    MockSecretProvider,
+    SecretProvider,
+)
 from pav.authority.errors import AccessDenied, ApprovalRequired, GrantInvalid
 from pav.domain.audit import AuditLog
 from pav.domain.models import (
@@ -51,6 +55,7 @@ class Authority:
         external_handles: dict[str, ExternalHandle] | None = None,
         policies: Iterable[Policy] = (),
         secret_provider: SecretProvider | None = None,
+        secret_providers: Mapping[str, SecretProvider] | None = None,
         clock: Callable[[], datetime] | None = None,
         storage: AuthorityStorage | None = None,
     ) -> None:
@@ -71,6 +76,11 @@ class Authority:
         self.external_handles = self.storage.load_external_handles()
         self.policies = list(policies)
         self.secret_provider = secret_provider or MockSecretProvider({})
+        self.secret_providers: dict[str, SecretProvider] = {
+            "mock": self.secret_provider,
+            MacOSKeychainSecretProvider.provider_name: MacOSKeychainSecretProvider(),
+        }
+        self.secret_providers.update(secret_providers or {})
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.agents = self.storage.load_agents()
         self.tasks = self.storage.load_tasks()
@@ -480,9 +490,12 @@ class Authority:
         handle = self.external_handles.get(capability)
         if handle is None:
             raise AccessDenied("unknown capability")
-        if not self.secret_provider.can_use(handle, destination):
+        provider = self.secret_providers.get(handle.provider)
+        if provider is None:
+            raise AccessDenied(f"no secret provider configured for {handle.provider}")
+        if not provider.can_use(handle, destination):
             raise AccessDenied("secret provider rejected the destination")
-        execution_handle = self.secret_provider.execute(handle, "use", destination)
+        execution_handle = provider.execute(handle, "use", destination)
         grant.uses += 1
         if grant.max_uses is not None and grant.uses >= grant.max_uses:
             grant.transition(GrantState.EXHAUSTED)
