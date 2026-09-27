@@ -187,6 +187,7 @@ class PolicyDecision(BaseModel):
     max_ttl: timedelta
     max_uses: int | None = None
     approved: bool = False
+    reasons: list[str] = Field(default_factory=list)
 
 
 class AuditEvent(BaseModel):

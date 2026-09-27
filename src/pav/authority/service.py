@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatchcase
 from typing import Any
@@ -12,6 +11,11 @@ from pav.authority.capabilities import (
     SecretProvider,
 )
 from pav.authority.errors import AccessDenied, ApprovalRequired, GrantInvalid
+from pav.authority.policy import (
+    EmbeddedPolicyDecisionPoint,
+    PolicyDecisionPoint,
+    PolicyResource,
+)
 from pav.domain.audit import AuditLog
 from pav.domain.models import (
     AccessRequest,
@@ -37,15 +41,8 @@ from pav.domain.types import (
 from pav.persistence import AuthorityStorage, InMemoryStorage
 
 
-@dataclass(frozen=True)
-class _Resource:
-    name: str
-    resource_type: str
-    sensitivity: Sensitivity
-
-
 class Authority:
-    """The Phase 0 policy decision point and policy enforcement point."""
+    """PAV's policy enforcement point and authority lifecycle."""
 
     def __init__(
         self,
@@ -54,6 +51,7 @@ class Authority:
         claims: dict[str, ClaimDefinition] | None = None,
         external_handles: dict[str, ExternalHandle] | None = None,
         policies: Iterable[Policy] = (),
+        policy_decision_point: PolicyDecisionPoint | None = None,
         secret_provider: SecretProvider | None = None,
         secret_providers: Mapping[str, SecretProvider] | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -75,6 +73,9 @@ class Authority:
         self.claims = self.storage.load_claims(evaluators)
         self.external_handles = self.storage.load_external_handles()
         self.policies = list(policies)
+        self.policy_decision_point = policy_decision_point or EmbeddedPolicyDecisionPoint(
+            self.policies
+        )
         self.secret_provider = secret_provider or MockSecretProvider({})
         self.secret_providers: dict[str, SecretProvider] = {
             "mock": self.secret_provider,
@@ -178,15 +179,15 @@ class Authority:
         )
         return request
 
-    def _resource(self, name: str) -> _Resource | None:
+    def _resource(self, name: str) -> PolicyResource | None:
         if name in self.attributes:
             attribute = self.attributes[name]
-            return _Resource(name, "attribute", attribute.sensitivity)
+            return PolicyResource(name, "attribute", attribute.sensitivity)
         if name in self.claims:
-            return _Resource(name, "claim", Sensitivity.MEDIUM)
+            return PolicyResource(name, "claim", Sensitivity.MEDIUM)
         if name in self.external_handles:
             handle = self.external_handles[name]
-            return _Resource(name, handle.resource_type, handle.sensitivity)
+            return PolicyResource(name, handle.resource_type, handle.sensitivity)
         return None
 
     def evaluate(self, request: AccessRequest) -> PolicyDecision:
@@ -194,77 +195,30 @@ class Authority:
         if task is None or task.agent_id != request.agent_id:
             raise AccessDenied("request is not bound to a known task and agent")
 
-        outcomes: list[DecisionOutcome] = []
-        matched_names: list[str] = []
-        ttl_caps: list[timedelta] = []
-        uses_caps: list[int] = []
-        reasons: list[str] = []
-        for item in request.items:
-            resource = self._resource(item.resource)
-            if resource is None:
-                outcomes.append(DecisionOutcome.DENY)
-                reasons.append(f"unknown resource: {item.resource}")
-                continue
-            if item.mode is AccessMode.REVEAL and resource.resource_type == "secret":
-                outcomes.append(DecisionOutcome.DENY)
-                reasons.append("secret resources cannot be revealed")
-                continue
-            matches = [
-                policy
-                for policy in self.policies
-                if policy.matches(
-                    purpose=request.purpose,
-                    mode=item.mode,
-                    sensitivity=resource.sensitivity,
-                    resource_type=resource.resource_type,
-                )
-            ]
-            matched_names.extend(policy.name for policy in matches)
-            if not matches:
-                outcomes.append(DecisionOutcome.APPROVAL_REQUIRED)
-                reasons.append(f"no automatic policy for {item.resource}")
-                continue
-            item_decisions = {policy.decision for policy in matches}
-            if DecisionOutcome.DENY in item_decisions:
-                outcomes.append(DecisionOutcome.DENY)
-            elif DecisionOutcome.APPROVAL_REQUIRED in item_decisions:
-                outcomes.append(DecisionOutcome.APPROVAL_REQUIRED)
-            else:
-                outcomes.append(DecisionOutcome.ALLOW)
-            ttl_caps.extend(policy.max_ttl for policy in matches)
-            uses_caps.extend(policy.max_uses for policy in matches if policy.max_uses is not None)
-
-        if DecisionOutcome.DENY in outcomes:
-            outcome = DecisionOutcome.DENY
-        elif DecisionOutcome.APPROVAL_REQUIRED in outcomes:
-            outcome = DecisionOutcome.APPROVAL_REQUIRED
-        else:
-            outcome = DecisionOutcome.ALLOW
-        ttl = min([request.requested_ttl, *ttl_caps])
-        max_uses = request.requested_max_uses
-        if uses_caps:
-            max_uses = min([value for value in [max_uses, *uses_caps] if value is not None])
-        decision = PolicyDecision(
-            request=request,
-            outcome=outcome,
-            matched_policy_names=matched_names,
-            max_ttl=ttl,
-            max_uses=max_uses,
-        )
+        resources = {
+            item.resource: resource
+            for item in request.items
+            if (resource := self._resource(item.resource)) is not None
+        }
+        decision = self.policy_decision_point.evaluate(request, resources)
         self.decisions[request.id] = decision
         self.storage.save_decision(decision)
         event_type = {
             DecisionOutcome.ALLOW: AuditEventType.POLICY_ALLOWED,
             DecisionOutcome.DENY: AuditEventType.POLICY_DENIED,
             DecisionOutcome.APPROVAL_REQUIRED: AuditEventType.APPROVAL_REQUESTED,
-        }[outcome]
+        }[decision.outcome]
         self._event(
             event_type,
             task_id=request.task_id,
             agent_id=request.agent_id,
             request_id=request.id,
             purpose=request.purpose,
-            metadata={"reason": "; ".join(reasons) if reasons else "matched policy"},
+            metadata={
+                "reason": "; ".join(decision.reasons)
+                if decision.reasons
+                else "matched policy"
+            },
         )
         return decision
 
