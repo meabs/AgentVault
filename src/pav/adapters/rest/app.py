@@ -7,11 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Form
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from pav.authority.errors import AccessDenied, ApprovalRequired, AuthorityError, GrantInvalid
 from pav.authority.service import Authority
+from pav.adapters.notifications import Notifier, build_notifier
 from pav.domain.models import AccessRequest, AccessRequestItem, Agent, Grant, PolicyDecision, Task
 from pav.domain.types import AccessMode, AuditEventType, DecisionOutcome, GrantState
 from pav.persistence import SQLiteStorage
@@ -36,6 +38,7 @@ class RequestStatus(BaseModel):
     request: AccessRequest
     decision: PolicyDecision
     grant: Grant | None = None
+    approval_url: str | None = None
 
 
 class RevealBody(BaseModel):
@@ -155,7 +158,10 @@ def _page(title: str, content: str) -> str:
     .permission {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr); gap: 18px; padding: 17px 0; border-bottom: 1px solid var(--line); }}
     .permission strong {{ font-weight: 700; }}
     .permission span {{ color: var(--muted); }}
-    .actions {{ display: flex; gap: 12px; flex-wrap: wrap; margin-top: 34px; }}
+    .actions {{ display: flex; gap: 12px; flex-wrap: wrap; margin-top: 34px; align-items: end; }}
+    .actions form {{ display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }}
+    .actions label {{ display: block; width: 100%; color: var(--muted); font-size: .85rem; font-weight: 700; }}
+    .actions input {{ border: 1px solid var(--line); border-radius: 8px; padding: 11px 12px; font: inherit; letter-spacing: .08em; text-transform: uppercase; }}
     button, .button {{ border: 1px solid var(--accent-dark); background: var(--accent); color: white; border-radius: 8px; padding: 11px 18px; font: inherit; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; }}
     button:hover, .button:hover {{ background: var(--accent-dark); color: white; }}
     button.secondary, .button.secondary {{ background: transparent; color: var(--accent-dark); }}
@@ -203,6 +209,8 @@ def _event_story(event: Any, authority: Authority) -> str:
         return f"Access denied by policy — {_text(event.purpose or 'protected request')}"
     if event.event_type is AuditEventType.APPROVAL_REQUESTED:
         return f"Human approval requested — {_text(event.purpose or 'additional authority')}"
+    if event.event_type is AuditEventType.APPROVAL_CODE_REJECTED:
+        return f"Approval code rejected — {_text(event.metadata.get('reason', 'invalid code'))}"
     if event.event_type is AuditEventType.APPROVAL_GRANTED:
         return f"Approval granted — {_text(event.purpose or 'request')}"
     if event.event_type is AuditEventType.APPROVAL_DENIED:
@@ -239,9 +247,27 @@ def _default_authority() -> Authority:
     return Authority(storage=SQLiteStorage(database))
 
 
-def create_app(authority: Authority | None = None) -> FastAPI:
+def create_app(
+    authority: Authority | None = None,
+    *,
+    notifier: Notifier | None = None,
+    approval_base_url: str | None = None,
+) -> FastAPI:
     authority = authority or _default_authority()
+    notifier = notifier or build_notifier()
+    approval_base_url = (approval_base_url or os.environ.get("PAV_APPROVAL_BASE_URL", "http://127.0.0.1:8000")).rstrip("/")
     api = FastAPI(title="Personal Authority Vault", version="0.1.0")
+    api.state.notifier = notifier
+
+    def approval_url(request_id: str) -> str:
+        return f"{approval_base_url}/approvals/{request_id}"
+
+    def prepare_approval(request_id: str) -> str:
+        delivery = authority.create_approval_challenge(request_id)
+        if delivery is not None:
+            code, _ = delivery
+            notifier.notify(request_id=request_id, code=code, approval_url=approval_url(request_id))
+        return approval_url(request_id)
 
     @api.exception_handler(AuthorityError)
     async def authority_error_handler(_: Request, error: AuthorityError) -> JSONResponse:
@@ -270,7 +296,14 @@ def create_app(authority: Authority | None = None) -> FastAPI:
         if request is None or decision is None:
             raise HTTPException(status_code=404, detail=f"unknown access request: {request_id}")
         grant = next((grant for grant in authority.grants.values() if grant.request_id == request_id), None)
-        return RequestStatus(request=request, decision=decision, grant=grant)
+        return RequestStatus(
+            request=request,
+            decision=decision,
+            grant=grant,
+            approval_url=approval_url(request_id)
+            if decision.outcome is DecisionOutcome.APPROVAL_REQUIRED
+            else None,
+        )
 
     def pending_requests() -> list[RequestStatus]:
         return sorted(
@@ -384,8 +417,8 @@ def create_app(authority: Authority | None = None) -> FastAPI:
             sections.append(f'<section class="mode-section"><header><h2>{_text(mode.value.upper())}</h2><span>{section_copy[mode][0]}</span></header>{body}</section>')
 
         if decision.outcome is DecisionOutcome.APPROVAL_REQUIRED and not decision.approved and status.grant is None:
-            banner = '<div class="notice">This request is waiting for your decision. Approving creates a short-lived task grant with exactly the permissions listed below.</div>'
-            actions = f'<div class="actions"><form method="post" action="/approvals/{_text(request.id)}/approve"><button type="submit">Approve request</button></form><form method="post" action="/approvals/{_text(request.id)}/deny"><button class="secondary" type="submit">Deny request</button></form></div>'
+            banner = '<div class="notice">This request is waiting for your decision. A human-presence code was sent to your desktop notification. It is not shown on this page. Enter it to approve; denying never requires the code.</div>'
+            actions = f'<div class="actions"><form method="post" action="/approvals/{_text(request.id)}/approve"><label for="approval-code">Human-presence code</label><input id="approval-code" name="code" type="text" inputmode="text" autocomplete="off" required><button type="submit">Approve request</button></form><form method="post" action="/approvals/{_text(request.id)}/deny"><button class="secondary" type="submit">Deny request</button></form></div>'
         elif status.grant is not None:
             banner = f'<div class="notice success"><strong>Approved.</strong> Grant <a href="/ui/grants/{_text(status.grant.id)}">{_text(status.grant.id)}</a> is active until {_text(_when(status.grant.expires_at))}.</div>'
             actions = '<div class="actions"><a class="button secondary" href="/">Return home</a></div>'
@@ -409,7 +442,18 @@ def create_app(authority: Authority | None = None) -> FastAPI:
         return _page("Review request", content)
 
     @api.post("/approvals/{request_id}/approve")
-    def ui_approve_request(request_id: str) -> RedirectResponse:
+    def ui_approve_request(request_id: str, code: str | None = Form(default=None)) -> RedirectResponse:
+        failure = authority.consume_approval_code(request_id, code)
+        if failure is not None:
+            authority.record_approval_code_failure(request_id, failure)
+            messages = {
+                "missing": "approval code is required",
+                "incorrect": "approval code is incorrect",
+                "expired": "approval code has expired",
+                "already_used": "approval code was already used",
+                "unavailable": "approval code is unavailable",
+            }
+            raise HTTPException(status_code=403, detail=messages[failure])
         approve_pending(request_id)
         return RedirectResponse(url=f"/approvals/{request_id}", status_code=303)
 
@@ -440,15 +484,20 @@ def create_app(authority: Authority | None = None) -> FastAPI:
         )
         decision = authority.evaluate(request)
         grant = authority.authorize(decision) if decision.outcome is DecisionOutcome.ALLOW else None
-        return RequestStatus(request=request, decision=decision, grant=grant)
+        if decision.outcome is DecisionOutcome.APPROVAL_REQUIRED:
+            prepare_approval(request.id)
+        return RequestStatus(
+            request=request,
+            decision=decision,
+            grant=grant,
+            approval_url=approval_url(request.id)
+            if decision.outcome is DecisionOutcome.APPROVAL_REQUIRED
+            else None,
+        )
 
     @api.get("/access-requests/{request_id}", response_model=RequestStatus)
     def get_request_status(request_id: str) -> RequestStatus:
         return status_for(request_id)
-
-    @api.post("/access-requests/{request_id}/approve", response_model=RequestStatus, status_code=201)
-    def approve_request(request_id: str) -> RequestStatus:
-        return approve_pending(request_id)
 
     @api.post("/access-requests/{request_id}/deny", response_model=RequestStatus, status_code=201)
     def deny_request(request_id: str) -> RequestStatus:

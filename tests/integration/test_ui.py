@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import timedelta
+
 from fastapi.testclient import TestClient
 
 from pav.adapters.rest.app import create_app
@@ -9,6 +11,11 @@ from pav.domain.types import AuditEventType, DecisionOutcome, GrantState
 
 def _client(authority: Authority) -> TestClient:
     return TestClient(create_app(authority))
+
+
+def _approval_code(client: TestClient, request_id: str) -> str:
+    notifications = client.app.state.notifier.notifications
+    return next(notification.code for notification in notifications if notification.request_id == request_id)
 
 
 def _pending_booking(client: TestClient) -> tuple[str, str]:
@@ -65,13 +72,21 @@ def test_approval_screen_explains_each_mode_and_five_questions(authority: Author
     assert "booking.example" in response.text
     assert "Approve request" in response.text
     assert "Deny request" in response.text
+    assert "A human-presence code was sent" in response.text
+    assert 'name="code"' in response.text
+    assert _approval_code(client, request_id) not in response.text
 
 
 def test_approve_button_issues_active_grant_in_domain(authority: Authority) -> None:
     client = _client(authority)
     task_id, request_id = _pending_booking(client)
 
-    response = client.post(f"/approvals/{request_id}/approve", follow_redirects=False)
+    code = _approval_code(client, request_id)
+    response = client.post(
+        f"/approvals/{request_id}/approve",
+        data={"code": code},
+        follow_redirects=False,
+    )
 
     assert response.status_code == 303
     decision = authority.decisions[request_id]
@@ -81,6 +96,81 @@ def test_approve_button_issues_active_grant_in_domain(authority: Authority) -> N
     assert grants[0].task_id == task_id
     assert grants[0].state is GrantState.ACTIVE
     assert "APPROVAL_GRANTED" in {event.event_type.value for event in authority.audit(task=task_id)}
+
+
+def test_approval_without_code_cannot_issue_grant_and_is_audited(authority: Authority) -> None:
+    client = _client(authority)
+    task_id, request_id = _pending_booking(client)
+
+    response = client.post(f"/approvals/{request_id}/approve", follow_redirects=False)
+
+    assert response.status_code == 403
+    assert "approval code is required" in response.json()["detail"]
+    assert not [grant for grant in authority.grants.values() if grant.request_id == request_id]
+    rejected = [event for event in authority.audit(task=task_id) if event.event_type is AuditEventType.APPROVAL_CODE_REJECTED]
+    assert rejected[-1].metadata["reason"] == "missing"
+
+
+def test_legacy_direct_rest_approval_route_is_not_available(authority: Authority) -> None:
+    client = _client(authority)
+    _, request_id = _pending_booking(client)
+
+    response = client.post(f"/access-requests/{request_id}/approve")
+
+    assert response.status_code == 404
+    assert not [grant for grant in authority.grants.values() if grant.request_id == request_id]
+
+
+def test_wrong_approval_code_fails_and_is_audited(authority: Authority) -> None:
+    client = _client(authority)
+    task_id, request_id = _pending_booking(client)
+
+    response = client.post(
+        f"/approvals/{request_id}/approve",
+        data={"code": "WRONG-CODE"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 403
+    assert "incorrect" in response.json()["detail"]
+    assert not [grant for grant in authority.grants.values() if grant.request_id == request_id]
+    rejected = [event for event in authority.audit(task=task_id) if event.event_type is AuditEventType.APPROVAL_CODE_REJECTED]
+    assert rejected[-1].metadata["reason"] == "incorrect"
+
+
+def test_expired_approval_code_fails_even_when_originally_correct(authority: Authority, clock) -> None:
+    client = _client(authority)
+    task_id, request_id = _pending_booking(client)
+    code = _approval_code(client, request_id)
+    clock.advance(timedelta(minutes=6))
+
+    response = client.post(
+        f"/approvals/{request_id}/approve",
+        data={"code": code},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 403
+    assert "expired" in response.json()["detail"]
+    assert not [grant for grant in authority.grants.values() if grant.request_id == request_id]
+    rejected = [event for event in authority.audit(task=task_id) if event.event_type is AuditEventType.APPROVAL_CODE_REJECTED]
+    assert rejected[-1].metadata["reason"] == "expired"
+
+
+def test_approval_code_cannot_be_reused_after_successful_approval(authority: Authority) -> None:
+    client = _client(authority)
+    task_id, request_id = _pending_booking(client)
+    code = _approval_code(client, request_id)
+
+    first = client.post(f"/approvals/{request_id}/approve", data={"code": code}, follow_redirects=False)
+    second = client.post(f"/approvals/{request_id}/approve", data={"code": code}, follow_redirects=False)
+
+    assert first.status_code == 303
+    assert second.status_code == 403
+    assert "already used" in second.json()["detail"]
+    assert len([grant for grant in authority.grants.values() if grant.request_id == request_id]) == 1
+    rejected = [event for event in authority.audit(task=task_id) if event.event_type is AuditEventType.APPROVAL_CODE_REJECTED]
+    assert rejected[-1].metadata["reason"] == "already_used"
 
 
 def test_deny_button_records_denial_and_issues_no_grant(authority: Authority) -> None:
@@ -107,7 +197,10 @@ def test_home_grants_and_audit_pages_render_readable_views(authority: Authority)
     assert client.get("/").status_code == 200
     assert "Pending requests" in client.get("/").text
 
-    client.post(f"/approvals/{request_id}/approve")
+    client.post(
+        f"/approvals/{request_id}/approve",
+        data={"code": _approval_code(client, request_id)},
+    )
     grant_id = next(grant.id for grant in authority.grants.values() if grant.request_id == request_id)
 
     grants = client.get("/ui/grants")

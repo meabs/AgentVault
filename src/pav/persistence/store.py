@@ -13,6 +13,7 @@ from cryptography.fernet import Fernet
 
 from pav.domain.models import (
     AccessRequest,
+    ApprovalChallenge,
     Agent,
     Attribute,
     AuditEvent,
@@ -43,6 +44,8 @@ class AuthorityStorage(Protocol):
     def save_request(self, request: AccessRequest) -> None: ...
     def load_decisions(self) -> dict[str, PolicyDecision]: ...
     def save_decision(self, decision: PolicyDecision) -> None: ...
+    def load_approval_challenges(self) -> dict[str, ApprovalChallenge]: ...
+    def save_approval_challenge(self, challenge: ApprovalChallenge) -> None: ...
     def load_grants(self) -> dict[str, Grant]: ...
     def save_grant(self, grant: Grant) -> None: ...
     def load_audit_events(self) -> list[AuditEvent]: ...
@@ -95,6 +98,7 @@ class InMemoryStorage:
         self.tasks: dict[str, Task] = {}
         self.requests: dict[str, AccessRequest] = {}
         self.decisions: dict[str, PolicyDecision] = {}
+        self.approval_challenges: dict[str, ApprovalChallenge] = {}
         self.grants: dict[str, Grant] = {}
         self.audit_events: list[AuditEvent] = []
 
@@ -142,6 +146,12 @@ class InMemoryStorage:
 
     def save_decision(self, decision: PolicyDecision) -> None:
         self.decisions[decision.request.id] = decision
+
+    def load_approval_challenges(self) -> dict[str, ApprovalChallenge]:
+        return dict(self.approval_challenges)
+
+    def save_approval_challenge(self, challenge: ApprovalChallenge) -> None:
+        self.approval_challenges[challenge.request_id] = challenge
 
     def load_grants(self) -> dict[str, Grant]:
         return dict(self.grants)
@@ -223,6 +233,7 @@ class SQLiteStorage:
                 CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS decisions (request_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS approval_challenges (request_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id TEXT PRIMARY KEY,
@@ -369,6 +380,18 @@ class SQLiteStorage:
         self._execute(
             "INSERT OR REPLACE INTO decisions (request_id, payload) VALUES (?, ?)",
             (decision.request.id, decision.model_dump_json()),
+        )
+
+    def load_approval_challenges(self) -> dict[str, ApprovalChallenge]:
+        return {
+            row["request_id"]: ApprovalChallenge.model_validate_json(row["payload"])
+            for row in self._execute("SELECT request_id, payload FROM approval_challenges")
+        }
+
+    def save_approval_challenge(self, challenge: ApprovalChallenge) -> None:
+        self._execute(
+            "INSERT OR REPLACE INTO approval_challenges (request_id, payload) VALUES (?, ?)",
+            (challenge.request_id, challenge.model_dump_json()),
         )
 
     def load_grants(self) -> dict[str, Grant]:

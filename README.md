@@ -25,7 +25,7 @@ Full product requirements: [`docs/PRD.md`](docs/PRD.md).
 |---|---|---|
 | 0 | Domain model + in-memory authority lifecycle (reveal/prove/use, policy evaluation, grants) | [`docs/phase0-report.md`](docs/phase0-report.md) |
 | 1a | Encrypted SQLite persistence + REST API | [`docs/phase1a-report.md`](docs/phase1a-report.md) |
-| 1b | MCP server (9 tools) | [`docs/phase1b-report.md`](docs/phase1b-report.md) |
+| 1b | MCP server (8 tools) | [`docs/phase1b-report.md`](docs/phase1b-report.md) |
 | 1c | Approval UI, narrative audit timeline, 3 runnable demonstrators | [`docs/phase1c-report.md`](docs/phase1c-report.md) |
 | 2 | Real macOS Keychain secret provider (credential never leaves the process) | [`docs/phase2-report.md`](docs/phase2-report.md) |
 | 3 | Formal PDP/PEP boundary + experimental AuthZEN-shaped adapter | [`docs/phase3-report.md`](docs/phase3-report.md) |
@@ -39,21 +39,25 @@ being accepted — not taken on the agent's own word.
 
 ```bash
 uv sync
-uv run pytest                                    # full suite (39 tests)
+uv run pytest                                    # full suite (46 tests)
 uv run uvicorn pav.adapters.rest.app:app --reload # REST API + local web UI at http://127.0.0.1:8000/
 uv run python examples/travel/low_risk_context.py       # demo 1: auto-allowed low-risk context
 uv run python examples/travel/progressive_disclosure.py # demo 2: search -> booking, approval required
 uv run python examples/shopping/zero_exposure.py         # demo 3: credential used, never revealed
 ```
 
-## Known open problem: the approval channel
+## Approval channel status
 
-The current `vault.approve_request` MCP tool is a **temporary stand-in**,
-documented as such in `docs/phase1b-report.md`: any MCP client that can
-create a request can also approve it, which defeats the point of
-independent user authority (PRD principle P5 — "agents may request
-authority, they do not create their own authority"). Hardening this is the
-current focus; see commit history for progress.
+The approval channel is hardened: `vault.approve_request` is no longer an MCP
+tool, and the web approval page is the only grant-issuing path. Approval
+requires a short-lived, single-use code delivered through the configured
+notifier (`PAV_NOTIFIER=macos` for macOS desktop notifications; the default
+logged backend is suitable for CI/headless runs). Wrong, missing, expired, and
+reused codes are audited. This prevents an agent that only has the request ID
+and approval URL from approving its own request.
+
+It does not prevent social engineering: a human can still be tricked into
+reading a legitimate notification code to a malicious process.
 
 ## License
 

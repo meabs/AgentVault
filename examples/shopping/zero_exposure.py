@@ -38,11 +38,18 @@ async def run() -> None:
         )
         print_json("1. Agent requests USE, never REVEAL, for the booking credential", request)
         assert request["status"] == "approval_required"
+        code = next(
+            notification.code
+            for notification in app.state.notifier.notifications
+            if notification.request_id == request["request_id"]
+        )
 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://pav.local", follow_redirects=True
         ) as browser:
-            approved = await browser.post(f"/approvals/{request['request_id']}/approve")
+            approved = await browser.post(
+                f"/approvals/{request['request_id']}/approve", data={"code": code}
+            )
             approved.raise_for_status()
         print("2. User approves the capability at its destination.")
 

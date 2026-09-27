@@ -190,6 +190,15 @@ class PolicyDecision(BaseModel):
     reasons: list[str] = Field(default_factory=list)
 
 
+class ApprovalChallenge(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    code_digest: str
+    expires_at: datetime
+    used_at: datetime | None = None
+
+
 class AuditEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -212,6 +221,7 @@ __all__ = [
     "AccessRequestItem",
     "Agent",
     "Attribute",
+    "ApprovalChallenge",
     "AuditEvent",
     "ClaimDefinition",
     "ExternalHandle",

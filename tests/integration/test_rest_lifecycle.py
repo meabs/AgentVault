@@ -11,6 +11,11 @@ def _client(authority: Authority) -> TestClient:
     return TestClient(create_app(authority))
 
 
+def _approval_code(client: TestClient, request_id: str) -> str:
+    notifications = client.app.state.notifier.notifications
+    return next(notification.code for notification in notifications if notification.request_id == request_id)
+
+
 def _task(client: TestClient, agent_id: str = "travel-agent") -> str:
     response = client.post(
         "/tasks",
@@ -71,9 +76,13 @@ def test_rest_full_lifecycle_matches_phase0(authority: Authority) -> None:
     request_id = booking["request"]["id"]
     assert client.get(f"/access-requests/{request_id}").json()["decision"]["approved"] is False
 
-    approved = client.post(f"/access-requests/{request_id}/approve")
-    assert approved.status_code == 201
-    grant_id = approved.json()["grant"]["id"]
+    approved = client.post(
+        f"/approvals/{request_id}/approve",
+        data={"code": _approval_code(client, request_id)},
+        follow_redirects=False,
+    )
+    assert approved.status_code == 303
+    grant_id = next(grant.id for grant in authority.grants.values() if grant.request_id == request_id)
     assert client.post(
         f"/grants/{grant_id}/reveal",
         json={"resource": "identity.full_name", "task_id": task_id},
@@ -143,7 +152,12 @@ def test_rest_enforces_max_uses(authority: Authority) -> None:
     client = _client(authority)
     task_id = _task(client)
     booking = _booking_request(client, task_id)
-    grant_id = client.post(f"/access-requests/{booking['request']['id']}/approve").json()["grant"]["id"]
+    request_id = booking["request"]["id"]
+    client.post(
+        f"/approvals/{request_id}/approve",
+        data={"code": _approval_code(client, request_id)},
+    )
+    grant_id = next(grant.id for grant in authority.grants.values() if grant.request_id == request_id)
     payload = {
         "capability": "credentials.booking_site",
         "destination": "booking.example",
@@ -166,4 +180,3 @@ def test_rest_secret_reveal_is_denied(authority: Authority) -> None:
     assert response.status_code == 201
     assert response.json()["decision"]["outcome"] == "DENY"
     assert response.json()["grant"] is None
-

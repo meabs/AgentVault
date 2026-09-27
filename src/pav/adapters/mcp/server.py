@@ -12,6 +12,7 @@ from pydantic import Field
 
 from pav.authority.errors import AuthorityError
 from pav.authority.service import Authority
+from pav.adapters.notifications import Notifier, build_notifier
 from pav.domain.models import AccessRequestItem, Agent, Grant, PolicyDecision, Task
 from pav.domain.types import DecisionOutcome
 from pav.persistence import SQLiteStorage
@@ -110,9 +111,26 @@ def _request_result(
     }
 
 
-def create_server(authority: Authority | None = None) -> MCPServer:
+def create_server(
+    authority: Authority | None = None,
+    *,
+    notifier: Notifier | None = None,
+    approval_base_url: str | None = None,
+) -> MCPServer:
     """Create an MCP server whose tools delegate to one Authority instance."""
     authority = authority or _default_authority()
+    notifier = notifier or build_notifier()
+    approval_base_url = (approval_base_url or os.environ.get("PAV_APPROVAL_BASE_URL", "http://127.0.0.1:8000")).rstrip("/")
+
+    def approval_url(request_id: str) -> str:
+        return f"{approval_base_url}/approvals/{request_id}"
+
+    def prepare_approval(request_id: str) -> str:
+        delivery = authority.create_approval_challenge(request_id)
+        if delivery is not None:
+            code, _ = delivery
+            notifier.notify(request_id=request_id, code=code, approval_url=approval_url(request_id))
+        return approval_url(request_id)
     server = MCPServer(
         "Personal Authority Vault",
         version="0.1.0",
@@ -210,6 +228,8 @@ def create_server(authority: Authority | None = None) -> MCPServer:
             grant = authority.authorize(decision) if decision.outcome is DecisionOutcome.ALLOW else None
             result = _request_result(request.id, request, decision, grant)
             result["task"] = _json_model(task)
+            if decision.outcome is DecisionOutcome.APPROVAL_REQUIRED:
+                result["approval_url"] = prepare_approval(request.id)
             return result
 
     @server.tool(
@@ -220,25 +240,6 @@ def create_server(authority: Authority | None = None) -> MCPServer:
     def get_request_status(request_id: str) -> dict[str, Any]:
         with _translate_expected_errors():
             return _status_for(authority, request_id)
-
-    @server.tool(
-        name="vault.approve_request",
-        description=(
-            "Temporary Phase 1 approval stand-in: approve an approval-required request and issue its grant."
-        ),
-        structured_output=True,
-    )
-    def approve_request(request_id: str) -> dict[str, Any]:
-        with _translate_expected_errors():
-            current = _status_for(authority, request_id)
-            if current["grant"] is not None:
-                return current
-            decision = authority.decisions[request_id]
-            if decision.outcome is not DecisionOutcome.APPROVAL_REQUIRED:
-                raise ValueError("only approval-required requests can be approved")
-            approved = authority.approve(decision)
-            grant = authority.authorize(approved)
-            return _status_for(authority, grant.request_id or request_id)
 
     @server.tool(
         name="vault.reveal",

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from pav.adapters.mcp.server import create_server
+from pav.adapters.notifications import LogNotifier
 from pav.adapters.rest.app import create_app
 from pav.authority.capabilities import MockSecretProvider
 from pav.authority.service import Authority
@@ -78,7 +79,8 @@ def create_demo_stack() -> tuple[Authority, object, object]:
             {"credentials.booking_site": {"booking.example"}},
         ),
     )
-    return authority, create_server(authority), create_app(authority)
+    notifier = LogNotifier()
+    return authority, create_server(authority, notifier=notifier), create_app(authority, notifier=notifier)
 
 
 async def call_tool(client, name: str, arguments: dict) -> dict:

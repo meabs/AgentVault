@@ -12,7 +12,6 @@ SDK v2 (`mcp[cli]>=2,<3`, resolved to 2.2.0). The adapter is in
 - `vault.use`
 - `vault.get_grant`
 - `vault.revoke_grant`
-- `vault.approve_request`
 
 ## Adapter boundary
 
@@ -46,6 +45,12 @@ same MCP client to approve its own request defeats the purpose of independent
 user approval in the long-term design. This tool should be removed, protected
 by a separate trusted principal, or otherwise gated once a real approval UI or
 approval channel exists. It must not be treated as the final approval model.
+
+**Update — 27 September 2026:** the Phase 1b stand-in has now been removed
+from the MCP server. It was removed because an MCP client could approve its
+own request, violating PAV principle P5. The Phase 1c web UI is now the only
+approval path, and the approval-hardening work adds a separate human-presence
+code delivered outside the requesting process.
 
 ## Verification
 

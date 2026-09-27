@@ -60,7 +60,7 @@ def _request_args(**overrides: object) -> dict:
     return args
 
 
-def test_mcp_lists_all_tools_and_completes_lifecycle(authority: Authority) -> None:
+def test_mcp_lists_tools_and_stops_before_human_approval(authority: Authority) -> None:
     server = create_server(authority)
     assert _list_tools(server) == {
         "vault.list_available_context",
@@ -71,7 +71,6 @@ def test_mcp_lists_all_tools_and_completes_lifecycle(authority: Authority) -> No
         "vault.use",
         "vault.get_grant",
         "vault.revoke_grant",
-        "vault.approve_request",
     }
 
     search = _call(
@@ -106,38 +105,8 @@ def test_mcp_lists_all_tools_and_completes_lifecycle(authority: Authority) -> No
     assert booking["status"] == "approval_required"
     assert booking["grant"] is None
     request_id = booking["request"]["id"]
+    assert booking["approval_url"].endswith(f"/approvals/{request_id}")
     assert _call(server, "vault.get_request_status", {"request_id": request_id})["decision"]["approved"] is False
-
-    approved = _call(server, "vault.approve_request", {"request_id": request_id})
-    assert approved["status"] == "granted"
-    grant_id = approved["grant"]["id"]
-    assert _call(
-        server,
-        "vault.get_grant",
-        {"grant_id": grant_id},
-    )["permissions"] == booking["request"]["items"]
-    assert _call(
-        server,
-        "vault.reveal",
-        {"grant_id": grant_id, "resource": "identity.full_name", "task_id": task_id},
-    ) == {"attribute": "identity.full_name", "value": "Garry Smith"}
-    assert _call(
-        server,
-        "vault.prove",
-        {"grant_id": grant_id, "claim": "identity.age_over_18", "task_id": task_id},
-    ) == {"claim": "identity.age_over_18", "result": True}
-    used = _call(
-        server,
-        "vault.use",
-        {
-            "grant_id": grant_id,
-            "capability": "credentials.booking_site",
-            "destination": "booking.example",
-            "task_id": task_id,
-        },
-    )
-    assert used["status"] == "authorized"
-    assert "booking-secret-DO-NOT-LEAK" not in str(used)
 
     revoked = _call(server, "vault.revoke_grant", {"grant_id": search_grant_id})
     assert revoked["state"] == "revoked"

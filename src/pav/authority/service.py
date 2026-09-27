@@ -3,6 +3,10 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatchcase
+import hashlib
+import hmac
+import secrets
+from threading import RLock
 from typing import Any
 
 from pav.authority.capabilities import (
@@ -22,6 +26,7 @@ from pav.domain.models import (
     AccessRequestItem,
     Agent,
     Attribute,
+    ApprovalChallenge,
     AuditEvent,
     ClaimDefinition,
     ExternalHandle,
@@ -43,6 +48,8 @@ from pav.persistence import AuthorityStorage, InMemoryStorage
 
 class Authority:
     """PAV's policy enforcement point and authority lifecycle."""
+
+    approval_code_ttl = timedelta(minutes=5)
 
     def __init__(
         self,
@@ -87,8 +94,10 @@ class Authority:
         self.tasks = self.storage.load_tasks()
         self.requests = self.storage.load_requests()
         self.decisions = self.storage.load_decisions()
+        self.approval_challenges = self.storage.load_approval_challenges()
         self.grants = self.storage.load_grants()
         self._audit_log = AuditLog(self.storage.load_audit_events())
+        self._approval_lock = RLock()
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -221,6 +230,69 @@ class Authority:
             },
         )
         return decision
+
+    @staticmethod
+    def _approval_code_digest(code: str) -> str:
+        return hashlib.sha256(code.strip().upper().encode("utf-8")).hexdigest()
+
+    def create_approval_challenge(
+        self, request: AccessRequest | str
+    ) -> tuple[str, ApprovalChallenge] | None:
+        with self._approval_lock:
+            request_id = request.id if isinstance(request, AccessRequest) else request
+            decision = self.decisions.get(request_id)
+            if decision is None or decision.outcome is not DecisionOutcome.APPROVAL_REQUIRED:
+                raise ValueError("only approval-required requests can receive an approval code")
+            if request_id in self.approval_challenges:
+                return None
+            alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+            code = "".join(secrets.choice(alphabet) for _ in range(10))
+            challenge = ApprovalChallenge(
+                request_id=request_id,
+                code_digest=self._approval_code_digest(code),
+                expires_at=self._now() + self.approval_code_ttl,
+            )
+            self.approval_challenges[request_id] = challenge
+            self.storage.save_approval_challenge(challenge)
+            return code, challenge
+
+    def approval_code_failure(self, request_id: str, code: str | None) -> str | None:
+        challenge = self.approval_challenges.get(request_id)
+        if code is None or not code.strip():
+            return "missing"
+        if challenge is None:
+            return "unavailable"
+        if challenge.used_at is not None:
+            return "already_used"
+        if self._now() >= challenge.expires_at:
+            return "expired"
+        if not hmac.compare_digest(challenge.code_digest, self._approval_code_digest(code)):
+            return "incorrect"
+        return None
+
+    def consume_approval_code(self, request_id: str, code: str | None) -> str | None:
+        with self._approval_lock:
+            failure = self.approval_code_failure(request_id, code)
+            if failure is not None:
+                return failure
+            challenge = self.approval_challenges[request_id]
+            consumed = challenge.model_copy(update={"used_at": self._now()})
+            self.approval_challenges[request_id] = consumed
+            self.storage.save_approval_challenge(consumed)
+            return None
+
+    def record_approval_code_failure(self, request_id: str, reason: str) -> None:
+        request = self.requests.get(request_id)
+        if request is None:
+            return
+        self._event(
+            AuditEventType.APPROVAL_CODE_REJECTED,
+            task_id=request.task_id,
+            agent_id=request.agent_id,
+            request_id=request.id,
+            purpose=request.purpose,
+            metadata={"reason": reason},
+        )
 
     def approve(self, decision: PolicyDecision) -> PolicyDecision:
         if decision.outcome is not DecisionOutcome.APPROVAL_REQUIRED:

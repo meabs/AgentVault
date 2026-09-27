@@ -48,11 +48,18 @@ async def run() -> None:
         print_json("2. Booking asks for incremental identity and age authority", booking)
         assert booking["status"] == "approval_required"
         assert booking["grant"] is None
+        code = next(
+            notification.code
+            for notification in app.state.notifier.notifications
+            if notification.request_id == booking["request_id"]
+        )
 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://pav.local", follow_redirects=True
         ) as browser:
-            approved = await browser.post(f"/approvals/{booking['request_id']}/approve")
+            approved = await browser.post(
+                f"/approvals/{booking['request_id']}/approve", data={"code": code}
+            )
             approved.raise_for_status()
         print("3. User approves through the local PAV approval screen.")
 
