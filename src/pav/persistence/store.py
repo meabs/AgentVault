@@ -11,6 +11,11 @@ from typing import Protocol
 
 from cryptography.fernet import Fernet
 
+from pav.domain.audit import (
+    GENESIS_SEED,
+    seal_audit_event,
+    seal_next_audit_event,
+)
 from pav.domain.models import (
     AccessRequest,
     ApprovalChallenge,
@@ -163,7 +168,7 @@ class InMemoryStorage:
         return list(self.audit_events)
 
     def append_audit_event(self, event: AuditEvent) -> None:
-        self.audit_events.append(event)
+        self.audit_events.append(seal_next_audit_event(event, self.audit_events))
 
 
 class SQLiteStorage:
@@ -238,7 +243,8 @@ class SQLiteStorage:
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id TEXT PRIMARY KEY,
                     payload TEXT NOT NULL,
-                    sequence INTEGER UNIQUE NOT NULL
+                    sequence INTEGER UNIQUE NOT NULL,
+                    event_hash TEXT NOT NULL
                 );
                 """
             )
@@ -254,6 +260,33 @@ class SQLiteStorage:
                 self._connection.execute(
                     "ALTER TABLE external_handles ADD COLUMN allowed_destinations TEXT NOT NULL DEFAULT '[]'"
                 )
+            audit_columns = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(audit_events)")
+            }
+            if "event_hash" not in audit_columns:
+                self._connection.execute(
+                    "ALTER TABLE audit_events ADD COLUMN event_hash TEXT"
+                )
+                self._backfill_audit_chain()
+
+    def _backfill_audit_chain(self) -> None:
+        previous_hash = GENESIS_SEED
+        rows = self._connection.execute(
+            "SELECT id, payload, sequence FROM audit_events ORDER BY sequence"
+        ).fetchall()
+        for row in rows:
+            event = AuditEvent.model_validate_json(row["payload"])
+            sealed = seal_audit_event(
+                event,
+                sequence=int(row["sequence"]),
+                previous_hash=previous_hash,
+            )
+            self._connection.execute(
+                "UPDATE audit_events SET payload = ?, event_hash = ? WHERE id = ?",
+                (sealed.model_dump_json(), sealed.hash, row["id"]),
+            )
+            previous_hash = sealed.hash
 
     def _execute(self, sql: str, parameters: tuple = ()) -> list[sqlite3.Row]:
         with self._lock, self._connection:
@@ -402,15 +435,30 @@ class SQLiteStorage:
 
     def load_audit_events(self) -> list[AuditEvent]:
         return [
-            AuditEvent.model_validate_json(row["payload"])
-            for row in self._execute("SELECT payload FROM audit_events ORDER BY sequence")
+            AuditEvent.model_validate_json(row["payload"]).model_copy(
+                update={"sequence": row["sequence"], "hash": row["event_hash"]}
+            )
+            for row in self._execute(
+                "SELECT payload, sequence, event_hash FROM audit_events ORDER BY sequence"
+            )
         ]
 
     def append_audit_event(self, event: AuditEvent) -> None:
-        self._execute(
-            "INSERT INTO audit_events (id, payload, sequence) VALUES (?, ?, COALESCE((SELECT MAX(sequence) + 1 FROM audit_events), 1))",
-            (event.id, event.model_dump_json()),
-        )
+        with self._lock, self._connection:
+            previous = self._connection.execute(
+                "SELECT sequence, event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+            sequence = 1 if previous is None else int(previous["sequence"]) + 1
+            previous_hash = GENESIS_SEED if previous is None else previous["event_hash"]
+            sealed = seal_audit_event(
+                event,
+                sequence=sequence,
+                previous_hash=previous_hash or GENESIS_SEED,
+            )
+            self._connection.execute(
+                "INSERT INTO audit_events (id, payload, sequence, event_hash) VALUES (?, ?, ?, ?)",
+                (sealed.id, sealed.model_dump_json(), sequence, sealed.hash),
+            )
 
     def close(self) -> None:
         with self._lock:

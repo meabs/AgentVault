@@ -20,7 +20,7 @@ from pav.authority.policy import (
     PolicyDecisionPoint,
     PolicyResource,
 )
-from pav.domain.audit import AuditLog
+from pav.domain.audit import AuditLog, ChainVerificationResult, verify_audit_chain
 from pav.domain.models import (
     AccessRequest,
     AccessRequestItem,
@@ -609,3 +609,8 @@ class Authority:
             return self._audit_log.all()
         task_id = task.id if isinstance(task, Task) else task
         return self._audit_log.for_task(task_id)
+
+    def verify_audit_chain(self) -> ChainVerificationResult:
+        """Verify the persisted audit log, including events outside the current task."""
+
+        return verify_audit_chain(self.storage.load_audit_events())

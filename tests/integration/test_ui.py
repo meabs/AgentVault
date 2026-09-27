@@ -271,3 +271,21 @@ def test_home_grants_and_audit_pages_render_readable_views(authority: Authority)
     assert grants.status_code == detail.status_code == audit.status_code == 200
     assert grant_id in detail.text
     assert "Task story." in audit.text
+
+
+def test_task_audit_page_surfaces_chain_verification(authority: Authority) -> None:
+    client = _client(authority)
+    task_id, _ = _pending_booking(client)
+
+    verified = client.get(f"/ui/tasks/{task_id}/audit")
+
+    assert verified.status_code == 200
+    assert "Audit chain verified" in verified.text
+
+    authority.storage.audit_events[1].metadata["tampered"] = True
+
+    broken = client.get(f"/ui/tasks/{task_id}/audit")
+
+    assert broken.status_code == 200
+    assert "Audit chain broken" in broken.text
+    assert "sequence 2" in broken.text

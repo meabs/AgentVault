@@ -205,6 +205,8 @@ class AuditEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(default_factory=lambda: f"event_{uuid4().hex}")
+    sequence: int | None = None
+    hash: str | None = None
     event_type: AuditEventType
     timestamp: datetime = Field(default_factory=utc_now)
     task_id: str | None = None

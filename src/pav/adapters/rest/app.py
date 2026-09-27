@@ -635,13 +635,19 @@ def create_app(
     def task_audit(task_id: str) -> str:
         task = task_or_404(task_id)
         events = authority.audit(task=task)
+        verification = authority.verify_audit_chain()
         timeline = "".join(
             f'<li><span>{_event_story(event, authority)}</span><time>{_text(_when(event.timestamp))}</time></li>'
             for event in reversed(events)
         ) or '<li class="quiet">No events for this task.</li>'
+        if verification.ok:
+            integrity = f'<div class="notice success"><strong>Audit chain verified.</strong> {verification.checked_events} event(s) checked; no silent changes detected.</div>'
+        else:
+            integrity = f'<div class="notice danger"><strong>Audit chain broken.</strong> The first break is at sequence {_text(verification.first_break_sequence)}; stored content no longer matches the chain.</div>'
         content = f"""
         <div class="topline"><div><h1>Task story.</h1><p class="lede">{_text(task.objective)}</p></div></div>
         <dl class="detail-list"><div><dt>Task</dt><dd>{_text(task.id)}</dd></div><div><dt>Agent</dt><dd>{_text(_agent_name(authority, task.agent_id))}</dd></div><div><dt>Started</dt><dd>{_text(_when(task.created_at))}</dd></div></dl>
+        {integrity}
         <ul class="timeline">{timeline}</ul>
         """
         return _page("Task audit", content)

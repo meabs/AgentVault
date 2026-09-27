@@ -1,5 +1,6 @@
 """Protocol-independent PAV domain models."""
 
+from .audit import ChainVerificationResult, verify_audit_chain
 from .models import (
     AccessRequest,
     AccessRequestItem,
@@ -30,6 +31,7 @@ __all__ = [
     "Attribute",
     "AuditEvent",
     "AuditEventType",
+    "ChainVerificationResult",
     "ClaimDefinition",
     "DecisionOutcome",
     "ExternalHandle",
@@ -40,4 +42,5 @@ __all__ = [
     "PolicyDecision",
     "Sensitivity",
     "Task",
+    "verify_audit_chain",
 ]
