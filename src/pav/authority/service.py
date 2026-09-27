@@ -30,6 +30,7 @@ from pav.domain.types import (
     GrantState,
     Sensitivity,
 )
+from pav.persistence import AuthorityStorage, InMemoryStorage
 
 
 @dataclass(frozen=True)
@@ -51,17 +52,32 @@ class Authority:
         policies: Iterable[Policy] = (),
         secret_provider: SecretProvider | None = None,
         clock: Callable[[], datetime] | None = None,
+        storage: AuthorityStorage | None = None,
     ) -> None:
-        self.attributes = dict(attributes or {})
-        self.claims = dict(claims or {})
-        self.external_handles = dict(external_handles or {})
+        self.storage = storage or InMemoryStorage()
+        for attribute in (attributes or {}).values():
+            self.storage.save_attribute(attribute)
+        for claim in (claims or {}).values():
+            self.storage.save_claim(claim)
+        for handle in (external_handles or {}).values():
+            self.storage.save_external_handle(handle)
+        self.attributes = self.storage.load_attributes()
+        evaluators = {
+            name: claim.evaluator
+            for name, claim in (claims or {}).items()
+            if claim.evaluator is not None
+        }
+        self.claims = self.storage.load_claims(evaluators)
+        self.external_handles = self.storage.load_external_handles()
         self.policies = list(policies)
         self.secret_provider = secret_provider or MockSecretProvider({})
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self.agents: dict[str, Agent] = {}
-        self.tasks: dict[str, Task] = {}
-        self.grants: dict[str, Grant] = {}
-        self._audit_log = AuditLog()
+        self.agents = self.storage.load_agents()
+        self.tasks = self.storage.load_tasks()
+        self.requests = self.storage.load_requests()
+        self.decisions = self.storage.load_decisions()
+        self.grants = self.storage.load_grants()
+        self._audit_log = AuditLog(self.storage.load_audit_events())
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -71,10 +87,13 @@ class Authority:
 
     def _event(self, event_type: AuditEventType, **fields: Any) -> AuditEvent:
         event = AuditEvent(event_type=event_type, timestamp=self._now(), **fields)
-        return self._audit_log.append(event)
+        event = self._audit_log.append(event)
+        self.storage.append_audit_event(event)
+        return event
 
     def register_agent(self, agent: Agent) -> Agent:
         self.agents[agent.id] = agent
+        self.storage.save_agent(agent)
         return agent
 
     def create_task(
@@ -100,6 +119,7 @@ class Authority:
             expires_at=expires_at,
         )
         self.tasks[task.id] = task
+        self.storage.save_task(task)
         self._event(
             AuditEventType.TASK_CREATED,
             task_id=task.id,
@@ -133,6 +153,8 @@ class Authority:
             created_at=self._now(),
             reason=reason,
         )
+        self.requests[request.id] = request
+        self.storage.save_request(request)
         self._event(
             AuditEventType.ACCESS_REQUESTED,
             task_id=request.task_id,
@@ -219,6 +241,8 @@ class Authority:
             max_ttl=ttl,
             max_uses=max_uses,
         )
+        self.decisions[request.id] = decision
+        self.storage.save_decision(decision)
         event_type = {
             DecisionOutcome.ALLOW: AuditEventType.POLICY_ALLOWED,
             DecisionOutcome.DENY: AuditEventType.POLICY_DENIED,
@@ -240,6 +264,8 @@ class Authority:
         if decision.approved:
             return decision
         approved = decision.model_copy(update={"approved": True})
+        self.decisions[decision.request.id] = approved
+        self.storage.save_decision(approved)
         request = decision.request
         self._event(
             AuditEventType.APPROVAL_GRANTED,
@@ -269,6 +295,7 @@ class Authority:
             agent_id=request.agent_id,
             task_id=request.task_id,
             purpose=request.purpose,
+            request_id=request.id,
             permissions=[
                 GrantPermission(
                     mode=item.mode,
@@ -282,6 +309,7 @@ class Authority:
             max_uses=decision.max_uses,
         )
         self.grants[grant.id] = grant
+        self.storage.save_grant(grant)
         self._event(
             AuditEventType.GRANT_ISSUED,
             task_id=grant.task_id,
@@ -309,6 +337,7 @@ class Authority:
         now = self._now()
         if grant.state is GrantState.ACTIVE and now >= grant.expires_at:
             grant.transition(GrantState.EXPIRED)
+            self.storage.save_grant(grant)
             self._event(
                 AuditEventType.GRANT_EXPIRED,
                 task_id=grant.task_id,
@@ -394,8 +423,8 @@ class Authority:
             purpose=purpose,
         )
         definition = self.claims.get(claim)
-        if definition is None:
-            raise AccessDenied("unknown claim")
+        if definition is None or definition.evaluator is None:
+            raise AccessDenied("unknown claim or unavailable claim evaluator")
         source_values = {
             source: self.attributes[source].value for source in definition.source_attributes
         }
@@ -439,6 +468,7 @@ class Authority:
         grant.uses += 1
         if grant.max_uses is not None and grant.uses >= grant.max_uses:
             grant.transition(GrantState.EXHAUSTED)
+        self.storage.save_grant(grant)
         self._event(
             AuditEventType.CAPABILITY_USED,
             task_id=grant.task_id,
@@ -461,6 +491,7 @@ class Authority:
             return
         else:
             raise GrantInvalid(f"cannot revoke grant in state {grant.state}")
+        self.storage.save_grant(grant)
         self._event(
             AuditEventType.GRANT_REVOKED,
             task_id=grant.task_id,

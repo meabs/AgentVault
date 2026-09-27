@@ -39,7 +39,7 @@ class ClaimDefinition(BaseModel):
 
     name: str
     source_attributes: list[str]
-    evaluator: Callable[[Mapping[str, Any]], Any]
+    evaluator: Callable[[Mapping[str, Any]], Any] | None = None
 
 
 class ExternalHandle(BaseModel):
@@ -112,6 +112,7 @@ class Grant(BaseModel):
     agent_id: str
     task_id: str
     purpose: str
+    request_id: str | None = None
     permissions: list[GrantPermission]
     issued_at: datetime
     expires_at: datetime
