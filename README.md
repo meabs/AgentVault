@@ -62,3 +62,12 @@ reading a legitimate notification code to a malicious process.
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
+
+## Dependency security notes
+
+`cryptography` is pinned to `>=46` and kept current — all Dependabot
+advisories against it are resolved at the currently locked version
+(`50.0.1`). One open advisory remains against `pytest` (vulnerable tmpdir
+handling, fixed in `9.0.3`) — that version isn't released yet as of this
+writing; `pytest` is a dev-only test dependency, never shipped, so exposure
+is minimal. Revisit when `9.0.3` lands.
